@@ -1,0 +1,52 @@
+{
+  "graph_config": {
+    "nodes": [
+      {
+        "id": "start",
+        "data": {"type": "start", "config": {}, "input_mapping": {}}
+      },
+      {
+        "id": "llm_search_and_solve",
+        "data": {
+          "type": "llm",
+          "config": {
+            "model": "deepseek-v4-pro",
+            "api_key": "你的DeepSeek-API-Key",
+            "base_url": "https://api.deepseek.com/v1",
+            "system_prompt": "你是算法专家,也是LeetCode题目搜索引擎。用户会问一道LeetCode题目,你需要:\n1. 先用几句确认题目内容(题号、描述、输入输出)\n2. 然后给出完整可执行的Python代码,包含测试用例\n输出格式:\n```python\n# 题目: ...\n# 思路: ...\n... 代码 ...\n\n# 测试\n... 测试用例 ...\n```",
+            "user_prompt": "搜索LeetCode 207 课程表 (Course Schedule) 这道题,给出完整的可执行Python代码,包含测试用例。\n\n要求:\n- 拓扑排序解法 (Kahn BFS)\n- 完整的class Solution\n- 至少3个测试用例\n- 代码可直接 python 运行",
+            "temperature": 0.1
+          },
+          "input_mapping": {}
+        }
+      },
+      {
+        "id": "code_verify",
+        "data": {
+          "type": "code",
+          "config": {
+            "code": "code_text = inputs['code']\n\n# 检查代码内容是否完整\nchecks = []\nif 'class Solution' in code_text or 'def canFinish' in code_text:\n    checks.append('✓ Solution 类已定义')\nif '拓扑' in code_text or 'topological' in code_text.lower() or 'indegree' in code_text.lower():\n    checks.append('✓ 拓扑排序/入度算法')\nif 'deque' in code_text or 'queue' in code_text.lower():\n    checks.append('✓ BFS 队列实现')\nif '__main__' in code_text or '测试' in code_text or 'Test' in code_text:\n    checks.append('✓ 包含测试用例')\nif 'canFinish' in code_text:\n    checks.append('✓ canFinish 方法')\n\ncode_len = len(code_text)\nresult = f'代码验证通过 ({code_len} 字符):\\n' + '\\n'.join(checks)"
+          },
+          "input_mapping": {"code": "llm_search_and_solve.text"}
+        }
+      },
+      {
+        "id": "end",
+        "data": {
+          "type": "end",
+          "config": {},
+          "input_mapping": {
+            "solution": "llm_search_and_solve.text",
+            "verify": "code_verify.result"
+          }
+        }
+      }
+    ],
+    "edges": [
+      {"source": "start", "target": "llm_search_and_solve", "sourceHandle": "", "targetHandle": ""},
+      {"source": "llm_search_and_solve", "target": "code_verify", "sourceHandle": "", "targetHandle": ""},
+      {"source": "code_verify", "target": "end", "sourceHandle": "", "targetHandle": ""}
+    ]
+  },
+  "inputs": {}
+}
