@@ -14,10 +14,10 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from engine import NodeRegistry, WorkflowExecutor
-from nodes import CodeNode, EndNode, HTTPNode, LLMNode, StartNode
+from engine import ExecutionStore, NodeRegistry, WorkflowExecutor
+from nodes import CodeNode, EndNode, HTTPNode, IfElseNode, LLMNode, StartNode
 
 # --- Bootstrap: 注册节点类型 ---
 NodeRegistry.register("start", StartNode)
@@ -25,6 +25,8 @@ NodeRegistry.register("llm", LLMNode)
 NodeRegistry.register("code", CodeNode)
 NodeRegistry.register("http", HTTPNode)
 NodeRegistry.register("end", EndNode)
+NodeRegistry.register("if_else", IfElseNode)
+store = ExecutionStore()
 
 # --- App ---
 app = FastAPI(title="DiegoC-workflow", version="0.1.0")
@@ -43,7 +45,7 @@ logger = logging.getLogger(__name__)
 # --- Models ---
 class WorkflowRunRequest(BaseModel):
     graph_config: dict[str, Any]
-    inputs: dict[str, Any] = {}
+    inputs: dict[str, Any] = Field(default_factory=dict)
 
 
 # --- Routes ---
@@ -56,7 +58,7 @@ async def list_nodes():
 @app.post("/api/workflow/run")
 async def run_workflow(req: WorkflowRunRequest):
     """SSE 流式执行工作流"""
-    executor = WorkflowExecutor()
+    executor = WorkflowExecutor(store=store)
 
     async def event_stream():
         async for event in executor.run_sse(req.graph_config, req.inputs):
@@ -71,6 +73,17 @@ async def run_workflow(req: WorkflowRunRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.get("/api/workflow/runs/{run_id}")
+async def get_workflow_run(run_id: str):
+    """Query persisted workflow and node status."""
+    from fastapi import HTTPException
+
+    result = store.get_run(run_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="workflow run not found")
+    return result
 
 
 @app.get("/health")

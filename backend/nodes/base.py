@@ -30,6 +30,7 @@ class Node(ABC):
         self.node_id = node_id
         self.config = config
         self.input_mapping = input_mapping
+        self.execution_context: dict[str, Any] = {}
 
     @abstractmethod
     async def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
