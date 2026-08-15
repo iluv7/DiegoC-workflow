@@ -26,7 +26,7 @@ class VariablePool:
             raise KeyError(f"节点 '{node_id}' 没有字段 '{field}'，可用: {list(ns.keys())}")
         return ns[field]
 
-    def resolve(self, input_mapping: dict[str, str]) -> dict[str, Any]:
+    def resolve(self, input_mapping: dict[str, str], missing_nodes: set[str] | None = None) -> dict[str, Any]:
         """根据 input_mapping 从 pool 取上游值，组装成输入 dict。
 
         input_mapping 格式: {"本地变量名": "上游节点ID.字段名"}
@@ -42,7 +42,10 @@ class VariablePool:
             if "." not in ref:
                 raise ValueError(f"变量引用格式错误: '{ref}'，需要 '节点ID.字段名'")
             upstream_node, field = ref.split(".", 1)
-            resolved[local_name] = self.get(upstream_node, field)
+            if missing_nodes and upstream_node in missing_nodes:
+                resolved[local_name] = None
+            else:
+                resolved[local_name] = self.get(upstream_node, field)
         return resolved
 
     def flatten(self) -> dict[str, Any]:

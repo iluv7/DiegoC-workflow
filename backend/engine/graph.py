@@ -1,98 +1,150 @@
-"""工作流图 — DAG 的拓扑排序和 BFS 分层。
-
-核心算法:
-  - topological_sort: Kahn 算法 (BFS)，返回串行执行顺序
-  - bfs_levels: BFS 分层，同层节点无依赖关系，可并行
-"""
+"""Workflow graph validation and runtime edge-state helpers."""
 
 from collections import deque
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from enum import Enum
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from nodes.base import Node
 
 
-class WorkflowGraph:
-    """从 nodes dict + edges list 构建 DAG，提供拓扑排序和分层。"""
+class EdgeState(str, Enum):
+    UNKNOWN = "unknown"
+    TAKEN = "taken"
+    SKIPPED = "skipped"
 
-    def __init__(
-        self,
-        nodes: dict[str, "Node"],
-        edges: list[dict[str, str]],
-    ) -> None:
+
+@dataclass(slots=True)
+class RuntimeEdge:
+    source: str
+    target: str
+    source_handle: str = "source"
+    target_handle: str = "target"
+    state: EdgeState = EdgeState.UNKNOWN
+
+
+class WorkflowGraph:
+    """Validated DAG with per-run, three-state edges."""
+
+    def __init__(self, nodes: dict[str, "Node"], edges: list[dict[str, str]]) -> None:
         self.nodes = nodes
-        self.edges = edges
-        self._adj: dict[str, list[str]] = {}
-        self._in_degree: dict[str, int] = {}
+        self.edges = [
+            RuntimeEdge(
+                source=e["source"],
+                target=e["target"],
+                source_handle=e.get("sourceHandle") or "source",
+                target_handle=e.get("targetHandle") or "target",
+            )
+            for e in edges
+        ]
+        self._outgoing = {nid: [] for nid in nodes}
+        self._incoming = {nid: [] for nid in nodes}
         self._build()
 
     def _build(self) -> None:
-        """构建邻接表和入度表"""
-        self._adj = {nid: [] for nid in self.nodes}
-        self._in_degree = {nid: 0 for nid in self.nodes}
-
+        seen: set[tuple[str, str, str, str]] = set()
         for edge in self.edges:
-            src, tgt = edge["source"], edge["target"]
-            if src not in self._adj or tgt not in self._adj:
-                raise ValueError(f"边引用了不存在的节点: {src} → {tgt}")
-            self._adj[src].append(tgt)
-            self._in_degree[tgt] += 1
+            if edge.source not in self.nodes or edge.target not in self.nodes:
+                raise ValueError(f"边引用了不存在的节点: {edge.source} → {edge.target}")
+            key = (edge.source, edge.target, edge.source_handle, edge.target_handle)
+            if key in seen:
+                raise ValueError(f"存在重复边: {edge.source} → {edge.target} ({edge.source_handle})")
+            seen.add(key)
+            self._outgoing[edge.source].append(edge)
+            self._incoming[edge.target].append(edge)
 
     def validate(self) -> None:
-        """验证 DAG 合法性: 检测环、检测孤立节点"""
+        if not self.nodes:
+            raise ValueError("工作流至少需要一个节点")
         order = self.topological_sort()
         if len(order) != len(self.nodes):
-            # 有环 — 找出剩余节点
-            remaining = set(self.nodes.keys()) - set(order)
-            raise ValueError(f"工作流存在循环依赖，以下节点无法排序: {remaining}")
+            remaining = set(self.nodes) - set(order)
+            raise ValueError(f"工作流存在循环依赖: {remaining}")
+        starts = [nid for nid, n in self.nodes.items() if n.node_type == "start"]
+        ends = [nid for nid, n in self.nodes.items() if n.node_type == "end"]
+        if len(starts) != 1:
+            raise ValueError("工作流必须且只能有一个 start 节点")
+        if not ends:
+            raise ValueError("工作流至少需要一个 end 节点")
+        if self._incoming[starts[0]]:
+            raise ValueError("start 节点不能有入边")
+        for nid in ends:
+            if self._outgoing[nid]:
+                raise ValueError(f"end 节点不能有出边: {nid}")
+        ancestors: dict[str, set[str]] = {nid: set() for nid in self.nodes}
+        for nid in order:
+            for edge in self._outgoing[nid]:
+                ancestors[edge.target].update(ancestors[nid] | {nid})
+        for nid, node in self.nodes.items():
+            errors = node.validate_config()
+            if errors:
+                raise ValueError(f"节点 {nid} 配置错误: {'; '.join(errors)}")
+            for ref in node.input_mapping.values():
+                if "." not in ref:
+                    raise ValueError(f"节点 {nid} 的变量引用格式错误: {ref}")
+                upstream = ref.split(".", 1)[0]
+                if upstream not in self.nodes:
+                    raise ValueError(f"节点 {nid} 引用了不存在的节点: {upstream}")
+                if upstream not in ancestors[nid]:
+                    raise ValueError(f"节点 {nid} 只能引用拓扑上游节点: {upstream}")
 
     def topological_sort(self) -> list[str]:
-        """Kahn 算法: 不断取入度为 0 的节点，返回串行执行顺序"""
-        in_degree = dict(self._in_degree)
-        queue = deque([nid for nid, d in in_degree.items() if d == 0])
+        indegree = {nid: len(edges) for nid, edges in self._incoming.items()}
+        queue = deque(nid for nid, degree in indegree.items() if degree == 0)
         order: list[str] = []
-
         while queue:
             nid = queue.popleft()
             order.append(nid)
-            for neighbor in self._adj[nid]:
-                in_degree[neighbor] -= 1
-                if in_degree[neighbor] == 0:
-                    queue.append(neighbor)
-
+            for edge in self._outgoing[nid]:
+                indegree[edge.target] -= 1
+                if indegree[edge.target] == 0:
+                    queue.append(edge.target)
         return order
 
+    def roots(self) -> list[str]:
+        return [nid for nid, edges in self._incoming.items() if not edges]
+
+    def incoming(self, node_id: str) -> list[RuntimeEdge]:
+        return self._incoming[node_id]
+
+    def outgoing(self, node_id: str) -> list[RuntimeEdge]:
+        return self._outgoing[node_id]
+
+    def resolve_outgoing(self, node_id: str, selected_handle: str | None) -> set[str]:
+        """Resolve outgoing states and return affected target ids."""
+        affected: set[str] = set()
+        for edge in self.outgoing(node_id):
+            if selected_handle is None:
+                edge.state = EdgeState.SKIPPED if edge.source_handle == "fail-branch" else EdgeState.TAKEN
+            else:
+                edge.state = EdgeState.TAKEN if edge.source_handle == selected_handle else EdgeState.SKIPPED
+            affected.add(edge.target)
+        return affected
+
+    def readiness(self, node_id: str) -> str:
+        """Return ready, wait, or skip according to three-state incoming edges."""
+        edges = self.incoming(node_id)
+        if not edges:
+            return "ready"
+        if any(edge.state == EdgeState.UNKNOWN for edge in edges):
+            return "wait"
+        if any(edge.state == EdgeState.TAKEN for edge in edges):
+            return "ready"
+        return "skip"
+
+    # Kept for compatibility and documentation examples.
     def bfs_levels(self) -> list[list[str]]:
-        """BFS 分层: 同层节点之间无直接依赖，可并行执行。
-
-        Example:
-            A → B → D
-            A → C → D
-
-            第0层: [A]      (入度为0)
-            第1层: [B, C]   (只依赖A，彼此无依赖)
-            第2层: [D]      (依赖B和C)
-        """
-        remaining_in = dict(self._in_degree)
-        current_level = deque([nid for nid, d in remaining_in.items() if d == 0])
+        indegree = {nid: len(edges) for nid, edges in self._incoming.items()}
+        current = deque(nid for nid, degree in indegree.items() if degree == 0)
         levels: list[list[str]] = []
-
-        while current_level:
-            levels.append(list(current_level))
-            next_level: deque[str] = deque()
-
-            for nid in current_level:
-                for neighbor in self._adj[nid]:
-                    remaining_in[neighbor] -= 1
-                    if remaining_in[neighbor] == 0:
-                        next_level.append(neighbor)
-
-            current_level = next_level
-
-        # 检查是否有环
-        total = sum(len(lv) for lv in levels)
-        if total != len(self.nodes):
-            remaining = set(self.nodes.keys()) - {n for lv in levels for n in lv}
-            raise ValueError(f"工作流存在循环依赖: {remaining}")
-
+        while current:
+            levels.append(list(current))
+            nxt: deque[str] = deque()
+            for nid in current:
+                for edge in self._outgoing[nid]:
+                    indegree[edge.target] -= 1
+                    if indegree[edge.target] == 0:
+                        nxt.append(edge.target)
+            current = nxt
         return levels

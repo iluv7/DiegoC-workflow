@@ -77,6 +77,15 @@ class LLMNode(Node):
             "completion_tokens": usage.get("completion_tokens", 0),
         }
 
+    def validate_config(self) -> list[str]:
+        errors = []
+        if not self.config.get("api_key"):
+            errors.append("api_key 不能为空")
+        temperature = float(self.config.get("temperature", 0.7))
+        if not 0 <= temperature <= 2:
+            errors.append("temperature 必须在 0 到 2 之间")
+        return errors
+
     @staticmethod
     def _render_template(template: str, inputs: dict[str, Any]) -> str:
         """简单的 {{var}} 模板渲染，不需要 Jinja2。"""
