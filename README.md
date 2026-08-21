@@ -12,13 +12,15 @@
 
 ```mermaid
 flowchart TD
-    A["POST /api/workflow/run<br/>JSON: nodes + edges + inputs"] --> B["WorkflowGraph<br/>解析 DAG + 拓扑排序 + BFS 分层"]
-    B --> C["WorkflowExecutor<br/>逐层 asyncio.gather 并行执行"]
-    C --> D["VariablePool<br/>节点输出写入全局池, 下游按需取"]
-    D --> E{"还有下一层?"}
-    E -->|是| C
-    E -->|否| F["SSE Stream<br/>实时推送执行状态"]
-    F --> G["workflow_finish<br/>返回最终结果"]
+    A["POST /api/workflow/run<br/>JSON: nodes + edges + inputs"] --> B["GraphRuntimeState<br/>初始化 sys / env / 用户输入"]
+    A --> C["WorkflowGraph.init<br/>NodeFactory + Edge 解析静态图"]
+    B --> D["WorkflowExecutor<br/>逐层 asyncio.gather 并行执行"]
+    C --> D
+    D --> E["VariablePool<br/>执行时解析输入，完成后写回输出"]
+    E --> F{"还有下一层?"}
+    F -->|是| D
+    F -->|否| G["SSE Stream<br/>实时推送执行状态"]
+    G --> H["workflow_finish<br/>返回最终结果"]
 ```
 
 ## 后端怎么设计 Workflow 引擎
@@ -43,6 +45,16 @@ Workflow 就是一个 DAG，用 JSON 描述：
 
 - `nodes` — 每个节点有 id、type、config（节点特定参数）、input_mapping（从上游取哪个变量）
 - `edges` — 有向边，source → target 决定执行顺序
+
+JSON 只描述静态结构。`WorkflowGraph.init()` 遍历 `nodes`，由
+`NodeFactory` 根据 `data.type` 创建具体节点；遍历 `edges` 创建 `Edge`
+对象并建立邻接关系。节点构造时只接收静态 `config`、`input_mapping`
+和同一次执行共享的运行态引用，不接收用户输入。
+
+每次调用 `run()` 都会新建 `GraphRuntimeState`，把系统变量写入 `sys`、
+环境变量写入 `env`、用户输入写入 start 节点命名空间。节点真正执行时
+才通过 `resolve_inputs()` 从 `VariablePool` 解析输入，执行结果再写回池中。
+因此同一份 Graph JSON 可以用于不同请求，运行数据不会进入节点配置。
 
 ### 2. 拓扑排序 — 决定谁先谁后
 

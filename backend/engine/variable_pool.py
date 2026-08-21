@@ -26,6 +26,13 @@ class VariablePool:
             raise KeyError(f"节点 '{node_id}' 没有字段 '{field}'，可用: {list(ns.keys())}")
         return ns[field]
 
+    def namespace(self, node_id: str) -> dict[str, Any]:
+        """Return a copy of one namespace, such as the root node inputs."""
+        ns = self._data.get(node_id)
+        if ns is None:
+            raise KeyError(f"变量命名空间 '{node_id}' 不存在")
+        return dict(ns)
+
     def resolve(self, input_mapping: dict[str, str]) -> dict[str, Any]:
         """根据 input_mapping 从 pool 取上游值，组装成输入 dict。
 

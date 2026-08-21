@@ -1,20 +1,20 @@
 """执行器 — asyncio 并行执行工作流，SSE 流式输出。
 
 核心流程:
-  1. 从 graph_config (JSON) 构建 WorkflowGraph + 实例化 Node
-  2. BFS 分层
-  3. 逐层执行: 同层 asyncio.gather 并行，层间屏障
-  4. 每完成一个节点就 yield SSE 事件
+  1. 请求输入创建 GraphRuntimeState
+  2. Graph.init + NodeFactory 将 JSON 构建为静态图
+  3. 节点执行时从运行态变量池解析输入
+  4. 逐层 asyncio.gather 并行执行并发送事件
 """
 
 import asyncio
 import json
 import logging
-import time
 from typing import Any, AsyncGenerator, Callable
 
 from .graph import WorkflowGraph
-from .node_registry import NodeRegistry
+from .node_factory import NodeFactory
+from .runtime import GraphRuntimeState
 from .variable_pool import VariablePool
 
 logger = logging.getLogger(__name__)
@@ -25,6 +25,7 @@ class WorkflowExecutor:
 
     def __init__(self) -> None:
         self.pool = VariablePool()
+        self.runtime_state: GraphRuntimeState | None = None
 
     async def run(
         self,
@@ -35,6 +36,8 @@ class WorkflowExecutor:
         on_node_finish: Callable[[str, dict[str, Any]], Any] | None = None,
         on_workflow_finish: Callable[[dict[str, Any]], Any] | None = None,
         on_error: Callable[[str], Any] | None = None,
+        system_variables: dict[str, Any] | None = None,
+        environment_variables: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """执行工作流，支持回调。
 
@@ -45,31 +48,29 @@ class WorkflowExecutor:
             on_node_finish: 节点完成回调(node_id, outputs)
             on_workflow_finish: 工作流完成回调(final_output)
             on_error: 错误回调(error_message)
+            system_variables: 本次运行的系统变量，存入 sys 命名空间
+            environment_variables: 本次运行的环境变量，存入 env 命名空间
 
         Returns:
             最终输出 dict
         """
-        nodes_config = graph_config.get("nodes", [])
-        edges = graph_config.get("edges", [])
+        # RuntimeState comes from this request, not from workflow JSON. Only the
+        # start node id is inspected before node construction so inputs can be
+        # placed in its variable namespace.
+        root_node_id = self._find_root_node_id(graph_config)
+        runtime_state = GraphRuntimeState.bootstrap(
+            root_node_id,
+            user_inputs,
+            system_variables=system_variables,
+            environment_variables=environment_variables,
+        )
+        self.runtime_state = runtime_state
+        self.pool = runtime_state.variable_pool
 
-        # 1. 实例化所有节点
-        node_instances: dict[str, Any] = {}
-        for nc in nodes_config:
-            node_id = nc["id"]
-            data = nc.get("data", {})
-            node_type = data.get("type", "")
-            config = data.get("config", {})
-            input_mapping = data.get("input_mapping", {})
-            node_instances[node_id] = NodeRegistry.create(
-                node_type=node_type,
-                node_id=node_id,
-                config=config,
-                input_mapping=input_mapping,
-            )
-
-        # 2. 构建 DAG
-        graph = WorkflowGraph(node_instances, edges)
-        graph.validate()
+        # Static Graph comes from JSON. Nodes receive a runtime reference, but
+        # user input is never copied into their config or constructor arguments.
+        graph = WorkflowGraph.init(graph_config, NodeFactory(runtime_state))
+        node_instances = graph.nodes
         levels = graph.bfs_levels()
 
         logger.info("工作流开始，共 %d 层: %s", len(levels), [[n for n in lv] for lv in levels])
@@ -78,24 +79,12 @@ class WorkflowExecutor:
         for level_idx, level in enumerate(levels):
             logger.info("── 第 %d 层: %s ──", level_idx, level)
 
-            if level_idx == 0:
-                # 第一层: 起始节点直接接收 user_inputs
-                tasks = []
-                for nid in level:
-                    node = node_instances[nid]
-                    if on_node_start:
-                        await on_node_start(nid, node.node_type)
-                    tasks.append(self._run_node(nid, node, user_inputs))
-            else:
-                # 后续层: 从 pool resolve 输入
-                tasks = []
-                for nid in level:
-                    node = node_instances[nid]
-                    if on_node_start:
-                        await on_node_start(nid, node.node_type)
-                    resolved_inputs = {} if node.input_mapping else user_inputs if level_idx == 0 else self.pool.resolve(node.input_mapping)
-                    # 注意: 非第一层的 resolve 已经用了前面的逻辑
-                    tasks.append(self._run_node_with_resolve(nid, node))
+            tasks = []
+            for nid in level:
+                node = node_instances[nid]
+                if on_node_start:
+                    await on_node_start(nid, node.node_type)
+                tasks.append(self._run_node(nid, node))
 
             results = await asyncio.gather(*tasks)
 
@@ -107,7 +96,7 @@ class WorkflowExecutor:
 
         # 4. 收集最终输出（最后一层的最后一个节点）
         final_nid = levels[-1][-1]
-        final_output = self.pool._data.get(final_nid, {})
+        final_output = runtime_state.outputs.get(final_nid, {})
         if on_workflow_finish:
             await on_workflow_finish(dict(final_output))
 
@@ -145,20 +134,35 @@ class WorkflowExecutor:
         for event in events:
             yield event
 
-    async def _run_node(self, nid: str, node: Any, inputs: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        """执行单个节点并写入 pool"""
+    async def _run_node(self, nid: str, node: Any) -> tuple[str, dict[str, Any]]:
+        """执行时从 RuntimeState 解析输入，再把输出写回同一运行态。"""
         logger.debug("  执行 %s:%s", node.node_type, nid)
+        inputs = node.resolve_inputs()
         outputs = await node.run(inputs)
-        self.pool.set(nid, outputs)
+        if not isinstance(outputs, dict):
+            raise TypeError(f"节点 {nid} 必须返回 dict")
+        if self.runtime_state is None:
+            raise RuntimeError("工作流运行态未初始化")
+        self.runtime_state.record_output(nid, outputs)
         return nid, outputs
 
-    async def _run_node_with_resolve(self, nid: str, node: Any) -> tuple[str, dict[str, Any]]:
-        """解析上游输入后执行节点"""
-        inputs = self.pool.resolve(node.input_mapping)
-        logger.debug("  执行 %s:%s 输入: %s", node.node_type, nid, inputs)
-        outputs = await node.run(inputs)
-        self.pool.set(nid, outputs)
-        return nid, outputs
+    @staticmethod
+    def _find_root_node_id(graph_config: dict[str, Any]) -> str:
+        if not isinstance(graph_config, dict):
+            raise ValueError("graph_config 必须是对象")
+        nodes = graph_config.get("nodes", [])
+        if not isinstance(nodes, list):
+            raise ValueError("graph_config.nodes 必须是数组")
+        starts = [
+            node.get("id")
+            for node in nodes
+            if isinstance(node, dict)
+            and isinstance(node.get("data"), dict)
+            and node["data"].get("type") == "start"
+        ]
+        if len(starts) != 1 or not isinstance(starts[0], str) or not starts[0]:
+            raise ValueError("工作流必须且只能有一个 start 节点")
+        return starts[0]
 
     @staticmethod
     def _sse(event: str, data: dict[str, Any]) -> str:

@@ -1,7 +1,10 @@
 """Node 基类 — 所有工作流节点的抽象父类。"""
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from engine.runtime import GraphRuntimeState
 
 
 class Node(ABC):
@@ -26,10 +29,21 @@ class Node(ABC):
         node_id: str,
         config: dict[str, Any],
         input_mapping: dict[str, str],
+        graph_runtime_state: "GraphRuntimeState | None" = None,
     ) -> None:
         self.node_id = node_id
         self.config = config
         self.input_mapping = input_mapping
+        self.graph_runtime_state = graph_runtime_state
+
+    def resolve_inputs(self) -> dict[str, Any]:
+        """Read this node's inputs from the per-run variable pool."""
+        if self.graph_runtime_state is None:
+            raise RuntimeError(f"节点 {self.node_id} 没有绑定运行态")
+        pool = self.graph_runtime_state.variable_pool
+        if self.node_type == "start":
+            return pool.namespace(self.node_id)
+        return pool.resolve(self.input_mapping)
 
     @abstractmethod
     async def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
