@@ -1,4 +1,4 @@
-"""Concurrent ready-queue workflow executor with retries and streaming events."""
+"""Ready-queue executor backed by a request-scoped GraphRuntimeState."""
 
 import asyncio
 import inspect
@@ -10,7 +10,8 @@ from typing import Any, AsyncGenerator, Callable
 
 from .execution_store import ExecutionStore
 from .graph import WorkflowGraph
-from .node_registry import NodeRegistry
+from .node_factory import NodeFactory
+from .runtime import GraphRuntimeState
 from .variable_pool import VariablePool
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ class WorkflowExecutor:
         self.store = store or ExecutionStore()
         self.max_concurrency = max(1, max_concurrency)
         self.pool = VariablePool()
+        self.runtime_state: GraphRuntimeState | None = None
         self.run_id: str | None = None
 
     async def run(
@@ -35,31 +37,31 @@ class WorkflowExecutor:
         on_error: Callback = None,
         on_event: Callback = None,
         run_id: str | None = None,
+        system_variables: dict[str, Any] | None = None,
+        environment_variables: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        self.pool = VariablePool()  # Never leak values between runs.
+        """Parse a graph and execute it with fresh state for this request."""
         self.run_id = run_id or str(uuid.uuid4())
-        nodes_config = graph_config.get("nodes", [])
-        raw_ids = [n.get("id") for n in nodes_config]
-        if len(raw_ids) != len(set(raw_ids)):
-            raise ValueError("节点 ID 不能重复")
+        root_node_id = self._find_root_node_id(graph_config)
+        runtime_state = GraphRuntimeState.bootstrap(
+            root_node_id,
+            user_inputs,
+            system_variables=system_variables,
+            environment_variables=environment_variables,
+        )
+        self.runtime_state = runtime_state
+        self.pool = runtime_state.variable_pool
 
-        instances: dict[str, Any] = {}
-        runtime_config: dict[str, dict[str, Any]] = {}
-        for nc in nodes_config:
-            node_id = nc.get("id")
-            if not isinstance(node_id, str) or not node_id:
-                raise ValueError("每个节点都必须有非空字符串 ID")
-            data = nc.get("data") or {}
-            instances[node_id] = NodeRegistry.create(
-                node_type=data.get("type", ""), node_id=node_id,
-                config=data.get("config") or {}, input_mapping=data.get("input_mapping") or {},
-            )
-            runtime_config[node_id] = data
+        # JSON creates the static node/edge objects. Request inputs stay in the
+        # runtime pool and are read only when each node is scheduled.
+        graph = WorkflowGraph.init(graph_config, NodeFactory(runtime_state))
+        instances = graph.nodes
+        runtime_config = {
+            node_config["id"]: node_config.get("data") or {}
+            for node_config in graph_config.get("nodes", [])
+        }
 
-        graph = WorkflowGraph(instances, graph_config.get("edges", []))
-        graph.validate()
-        now = time.time()
-        self.store.create_run(self.run_id, user_inputs, now)
+        self.store.create_run(self.run_id, user_inputs, time.time())
         await self._call(on_event, "workflow_start", {"run_id": self.run_id})
 
         pending: dict[asyncio.Task[tuple[dict[str, Any], str | None, int, str]], str] = {}
@@ -67,9 +69,9 @@ class WorkflowExecutor:
         completed: set[str] = set()
         skipped: set[str] = set()
         ready: asyncio.Queue[str] = asyncio.Queue()
-        for nid in graph.roots():
-            ready.put_nowait(nid)
-            queued.add(nid)
+        for node_id in graph.roots():
+            ready.put_nowait(node_id)
+            queued.add(node_id)
 
         async def propagate(targets: set[str]) -> None:
             stack = list(targets)
@@ -90,43 +92,67 @@ class WorkflowExecutor:
         try:
             while not ready.empty() or pending:
                 while not ready.empty() and len(pending) < self.max_concurrency:
-                    nid = ready.get_nowait()
-                    node = instances[nid]
+                    node_id = ready.get_nowait()
+                    node = instances[node_id]
                     node.execution_context = {
                         "workflow_run_id": self.run_id,
-                        "node_id": nid,
-                        "logical_execution_id": f"{self.run_id}:{nid}",
+                        "node_id": node_id,
+                        "logical_execution_id": f"{self.run_id}:{node_id}",
                     }
-                    inputs = user_inputs if node.node_type == "start" else self.pool.resolve(node.input_mapping, skipped)
-                    await self._call(on_node_start, nid, node.node_type)
-                    await self._call(on_event, "node_start", {"node_id": nid, "node_type": node.node_type})
-                    task = asyncio.create_task(self._execute_node(nid, node, inputs, runtime_config[nid], on_event))
-                    pending[task] = nid
+                    inputs = node.resolve_inputs(skipped)
+                    await self._call(on_node_start, node_id, node.node_type)
+                    await self._call(on_event, "node_start", {"node_id": node_id, "node_type": node.node_type})
+                    task = asyncio.create_task(
+                        self._execute_node(node_id, node, inputs, runtime_config[node_id], on_event)
+                    )
+                    pending[task] = node_id
+
                 if not pending:
                     break
                 done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
-                    nid = pending.pop(task)
+                    node_id = pending.pop(task)
                     outputs, selected_handle, retry_count, status = task.result()
-                    self.pool.set(nid, outputs)
-                    completed.add(nid)
-                    self.store.update_node(self.run_id, nid, status, retry_count, time.time(), output=outputs)
-                    await self._call(on_node_finish, nid, outputs)
-                    await self._call(on_event, "node_finish", {
-                        "node_id": nid, "outputs": outputs, "status": status,
-                        "retry_count": retry_count,
-                    })
-                    await propagate(graph.resolve_outgoing(nid, selected_handle))
+                    runtime_state.record_output(node_id, outputs)
+                    completed.add(node_id)
+                    self.store.update_node(
+                        self.run_id,
+                        node_id,
+                        status,
+                        retry_count,
+                        time.time(),
+                        output=outputs,
+                    )
+                    await self._call(on_node_finish, node_id, outputs)
+                    await self._call(
+                        on_event,
+                        "node_finish",
+                        {
+                            "node_id": node_id,
+                            "outputs": outputs,
+                            "status": status,
+                            "retry_count": retry_count,
+                        },
+                    )
+                    await propagate(graph.resolve_outgoing(node_id, selected_handle))
 
             unresolved = set(instances) - completed - skipped
             if unresolved:
                 raise RuntimeError(f"工作流停止但仍有未决节点: {sorted(unresolved)}")
-            end_ids = [nid for nid, node in instances.items() if node.node_type == "end" and nid in completed]
-            result = {nid: self.pool.snapshot()[nid] for nid in end_ids}
+            end_ids = [
+                node_id
+                for node_id, node in instances.items()
+                if node.node_type == "end" and node_id in completed
+            ]
+            result = {node_id: runtime_state.outputs[node_id] for node_id in end_ids}
             final_output = next(iter(result.values())) if len(result) == 1 else result
             self.store.update_run(self.run_id, "succeeded", time.time(), output=final_output)
             await self._call(on_workflow_finish, final_output)
-            await self._call(on_event, "workflow_finish", {"run_id": self.run_id, "result": final_output})
+            await self._call(
+                on_event,
+                "workflow_finish",
+                {"run_id": self.run_id, "result": final_output},
+            )
             return final_output
         except asyncio.CancelledError:
             for task in pending:
@@ -139,11 +165,20 @@ class WorkflowExecutor:
             await asyncio.gather(*pending, return_exceptions=True)
             self.store.update_run(self.run_id, "failed", time.time(), error=str(exc))
             await self._call(on_error, str(exc))
-            await self._call(on_event, "workflow_error", {"run_id": self.run_id, "error": str(exc)})
+            await self._call(
+                on_event,
+                "workflow_error",
+                {"run_id": self.run_id, "error": str(exc)},
+            )
             raise
 
     async def _execute_node(
-        self, nid: str, node: Any, inputs: dict[str, Any], data: dict[str, Any], on_event: Callback
+        self,
+        node_id: str,
+        node: Any,
+        inputs: dict[str, Any],
+        data: dict[str, Any],
+        on_event: Callback,
     ) -> tuple[dict[str, Any], str | None, int, str]:
         retry = data.get("retry_config") or node.config.get("retry_config") or {}
         enabled = bool(retry.get("retry_enabled", False))
@@ -153,21 +188,30 @@ class WorkflowExecutor:
         strategy = data.get("error_strategy") or node.config.get("error_strategy")
         retries = 0
         while True:
-            self.store.update_node(self.run_id, nid, "running", retries, time.time())
+            self.store.update_node(self.run_id, node_id, "running", retries, time.time())
             try:
                 call = node.run(inputs)
                 outputs = await asyncio.wait_for(call, float(timeout)) if timeout else await call
                 if not isinstance(outputs, dict):
-                    raise TypeError(f"节点 {nid} 必须返回 dict")
+                    raise TypeError(f"节点 {node_id} 必须返回 dict")
                 selected = outputs.pop("_selected_handle", None)
                 return outputs, selected, retries, "succeeded"
             except Exception as exc:
                 if retries < max_retries:
                     retries += 1
-                    self.store.update_node(self.run_id, nid, "retry", retries, time.time(), error=str(exc))
-                    await self._call(on_event, "node_retry", {
-                        "node_id": nid, "retry_count": retries, "error": str(exc),
-                    })
+                    self.store.update_node(
+                        self.run_id,
+                        node_id,
+                        "retry",
+                        retries,
+                        time.time(),
+                        error=str(exc),
+                    )
+                    await self._call(
+                        on_event,
+                        "node_retry",
+                        {"node_id": node_id, "retry_count": retries, "error": str(exc)},
+                    )
                     if interval:
                         await asyncio.sleep(interval)
                     continue
@@ -176,12 +220,23 @@ class WorkflowExecutor:
                 if strategy == "default_value":
                     default = data.get("default_value", node.config.get("default_value", {}))
                     if not isinstance(default, dict):
-                        raise ValueError(f"节点 {nid} 的 default_value 必须是对象") from exc
+                        raise ValueError(f"节点 {node_id} 的 default_value 必须是对象") from exc
                     return default, None, retries, "exception"
-                self.store.update_node(self.run_id, nid, "failed", retries, time.time(), error=str(exc))
+                self.store.update_node(
+                    self.run_id,
+                    node_id,
+                    "failed",
+                    retries,
+                    time.time(),
+                    error=str(exc),
+                )
                 raise
 
-    async def run_sse(self, graph_config: dict[str, Any], user_inputs: dict[str, Any]) -> AsyncGenerator[str, None]:
+    async def run_sse(
+        self,
+        graph_config: dict[str, Any],
+        user_inputs: dict[str, Any],
+    ) -> AsyncGenerator[str, None]:
         queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue()
         error_emitted = False
 
@@ -212,6 +267,24 @@ class WorkflowExecutor:
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+    @staticmethod
+    def _find_root_node_id(graph_config: dict[str, Any]) -> str:
+        if not isinstance(graph_config, dict):
+            raise ValueError("graph_config 必须是对象")
+        nodes = graph_config.get("nodes", [])
+        if not isinstance(nodes, list):
+            raise ValueError("graph_config.nodes 必须是数组")
+        starts = [
+            node.get("id")
+            for node in nodes
+            if isinstance(node, dict)
+            and isinstance(node.get("data"), dict)
+            and node["data"].get("type") == "start"
+        ]
+        if len(starts) != 1 or not isinstance(starts[0], str) or not starts[0]:
+            raise ValueError("工作流必须且只能有一个 start 节点")
+        return starts[0]
 
     @staticmethod
     async def _call(callback: Callback, *args: Any) -> None:

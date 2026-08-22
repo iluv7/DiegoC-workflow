@@ -1,8 +1,11 @@
 """节点注册表 — 管理节点类型的注册和实例化。"""
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from nodes.base import Node
+
+if TYPE_CHECKING:
+    from .runtime import GraphRuntimeState
 
 
 class NodeRegistry:
@@ -16,7 +19,14 @@ class NodeRegistry:
         cls._registry[node_type] = node_class
 
     @classmethod
-    def create(cls, node_type: str, node_id: str, config: dict[str, Any], input_mapping: dict[str, str]) -> Node:
+    def create(
+        cls,
+        node_type: str,
+        node_id: str,
+        config: dict[str, Any],
+        input_mapping: dict[str, str],
+        graph_runtime_state: "GraphRuntimeState | None" = None,
+    ) -> Node:
         """根据类型创建节点实例"""
         if node_type not in cls._registry:
             raise ValueError(f"未知节点类型: '{node_type}'，可用: {list(cls._registry.keys())}")
@@ -25,6 +35,7 @@ class NodeRegistry:
             node_id=node_id,
             config=config,
             input_mapping=input_mapping,
+            graph_runtime_state=graph_runtime_state,
         )
 
     @classmethod
