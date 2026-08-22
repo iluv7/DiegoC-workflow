@@ -1,10 +1,11 @@
 # ⚡ DiegoC Workflow
 
 **个人学习项目** — 从零理解 Workflow 引擎的核心原理。
-- DAG 有向无环图的拓扑排序
-- BFS 分层实现并行执行
+- DAG 校验与三态边（UNKNOWN / TAKEN / SKIPPED）
+- Ready Queue 动态并行调度与条件分支
 - 变量池在节点间传递数据
-- SSE 流式推送执行状态
+- 节点重试、失败分支、默认值和超时
+- SQLite 状态记录与真正的 SSE 流式事件
 
 ---
 
@@ -14,12 +15,12 @@
 flowchart TD
     A["POST /api/workflow/run<br/>JSON: nodes + edges + inputs"] --> B["GraphRuntimeState<br/>初始化 sys / env / 用户输入"]
     A --> C["WorkflowGraph.init<br/>NodeFactory + Edge 解析静态图"]
-    B --> D["WorkflowExecutor<br/>逐层 asyncio.gather 并行执行"]
+    B --> D["WorkflowExecutor<br/>Ready Queue 动态并行执行"]
     C --> D
     D --> E["VariablePool<br/>执行时解析输入，完成后写回输出"]
-    E --> F{"还有下一层?"}
-    F -->|是| D
-    F -->|否| G["SSE Stream<br/>实时推送执行状态"]
+    E --> F{"后继节点入边均已确定?"}
+    F -->|Ready| D
+    F -->|完成| G["SSE Stream<br/>实时推送执行状态"]
     G --> H["workflow_finish<br/>返回最终结果"]
 ```
 
@@ -56,7 +57,13 @@ JSON 只描述静态结构。`WorkflowGraph.init()` 遍历 `nodes`，由
 才通过 `resolve_inputs()` 从 `VariablePool` 解析输入，执行结果再写回池中。
 因此同一份 Graph JSON 可以用于不同请求，运行数据不会进入节点配置。
 
-### 2. 拓扑排序 — 决定谁先谁后
+### 2. 图推进语义
+
+边在运行时具有 `UNKNOWN`、`TAKEN`、`SKIPPED` 三种状态。目标节点只有在所有入边均已确定且至少一条为 `TAKEN` 时才进入 Ready Queue；全部为 `SKIPPED` 时会递归跳过。`if_else` 节点通过 `_selected_handle` 选择 `true` 或 `false` 出口。
+
+拓扑排序用于静态环检测，不再直接决定实际执行路径。
+
+### 2.1 拓扑排序 — 静态校验
 
 从 edges 构建邻接表 + 入度表，用 Kahn 算法 (BFS) 生成执行顺序：
 
@@ -82,30 +89,20 @@ def topological_sort(nodes, edges):
 
 如果 `len(order) != len(nodes)` 则存在循环依赖。
 
-### 3. BFS 分层 — 找出哪些可以并行
+### 3. Ready Queue — 找出哪些可以并行
 
-Kahn 算法天然支持分层：每次 queue 里同时出现的节点没有依赖关系，可以并行：
+节点完成后立即更新出边并检查受影响的后继节点，不需要等待同一静态层中的慢节点：
 
 ```python
-def bfs_levels(nodes, edges):
-    # 构建邻接表和入度
-    current_level = deque([入度为0的节点])
-    levels = []
-
-    while current_level:
-        levels.append(list(current_level))   # 同一层可以并行
-        next_level = deque()
-        for nid in current_level:
-            for neighbor in adj[nid]:
-                in_degree[neighbor] -= 1
-                if in_degree[neighbor] == 0:
-                    next_level.append(neighbor)
-        current_level = next_level
-
-    return levels  # [[A], [B, C], [D]]
+if any(edge.state == UNKNOWN for edge in incoming_edges):
+    wait()
+elif any(edge.state == TAKEN for edge in incoming_edges):
+    ready_queue.put(node_id)
+else:
+    skip_and_propagate(node_id)
 ```
 
-同层节点用 `asyncio.gather` 并行执行，层与层之间是屏障。
+Ready Queue 中的节点在并发上限内立即执行；不存在静态层间屏障。
 
 ### 4. 变量池 — 节点间传数据
 
@@ -140,24 +137,19 @@ class NodeRegistry:
 
 新增节点类型只需继承 `Node` + 调用 `NodeRegistry.register()`。
 
-### 6. 执行引擎 — asyncio 并行
+### 6. 执行引擎 — asyncio 动态并行
 
 ```python
 class WorkflowExecutor:
     async def run(graph_config, user_inputs):
-        levels = graph.bfs_levels()  # 分层
-
-        for level in levels:
-            # 同层节点并行
-            tasks = [node.run(inputs) for node in level]
-            results = await asyncio.gather(*tasks)
-
-            # 写入变量池
-            for nid, outputs in results:
-                pool.set(nid, outputs)
+        ready = graph.roots()
+        while ready or running:
+            # 最多 max_concurrency 个节点并行
+            # 任一节点完成后立即推进其后继边
+            await wait_for_first_completed()
 ```
 
-单线程 + asyncio 没有 GIL 问题 — 节点做 I/O（调 LLM API、发 HTTP 请求）时 `await` 自动让出，其他协程继续跑。
+节点配置支持 `retry_config`、`timeout`、`error_strategy=fail_branch|default_value`。HTTP 副作用请求会携带同一逻辑执行内稳定的 `Idempotency-Key`。
 
 ## 节点类型
 
@@ -167,7 +159,15 @@ class WorkflowExecutor:
 | **llm** | 调 OpenAI 兼容 API | `model, api_key, base_url, system_prompt, user_prompt` |
 | **code** | 执行 Python 片段 | `code` |
 | **http** | 发 HTTP 请求 | `method, url, headers, body` |
+| **if_else** | 条件分支 | `variable, operator, value` |
 | **end** | 出口，组装输出 | `output_fields` |
+
+## 安全说明
+
+- Code 节点默认禁用。只有本地可信代码可设置 `ALLOW_UNSAFE_CODE_EXECUTION=true`；生产环境应接入独立容器沙箱。
+- HTTP 节点默认拒绝本机、内网和非全局地址，开发环境确有需要时可设置 `WORKFLOW_ALLOW_PRIVATE_HTTP=true`。
+- `test_workflow.json` 被 Git 忽略；API Key 不应保存在工作流文件中。已经暴露的 Key 必须在服务商后台吊销。
+- 执行记录默认保存在 `backend/workflow_runs.db`，也可通过 `WORKFLOW_DB_PATH` 指定位置。状态查询接口为 `GET /api/workflow/runs/{run_id}`。
 
 ## 项目结构
 
@@ -180,15 +180,17 @@ DiegoC-workflow/
     ├── requirements.txt
     ├── engine/
     │   ├── variable_pool.py  # 变量池
-    │   ├── graph.py          # DAG + 拓扑排序 + BFS 分层
+    │   ├── graph.py          # DAG 校验 + 三态边
     │   ├── node_registry.py  # 节点注册表
-    │   └── executor.py       # asyncio 执行器 + SSE
+    │   ├── execution_store.py# SQLite 执行记录
+    │   └── executor.py       # Ready Queue + 重试 + SSE
     └── nodes/
         ├── base.py           # Node 抽象基类
         ├── start_node.py
         ├── llm_node.py
         ├── code_node.py
         ├── http_node.py
+        ├── if_else_node.py
         └── end_node.py
 ```
 

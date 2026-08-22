@@ -28,7 +28,11 @@ class EndNode(Node):
             for field in output_fields:
                 if field in inputs:
                     result[field] = inputs[field]
-            return result if result else inputs
+            return result
         else:
             # 未指定则透传全部
             return dict(inputs)
+
+    def validate_config(self) -> list[str]:
+        fields = self.config.get("output_fields", [])
+        return [] if isinstance(fields, list) else ["output_fields 必须是数组"]

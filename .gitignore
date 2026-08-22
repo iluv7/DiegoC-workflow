@@ -7,3 +7,6 @@ dist/
 .DS_Store
 node_modules/
 test_workflow.json
+workflow_runs.db
+workflow_runs.db-shm
+workflow_runs.db-wal

@@ -2,6 +2,7 @@
 
 import io
 import logging
+import os
 from typing import Any
 
 from .base import Node
@@ -33,6 +34,11 @@ class CodeNode(Node):
     }
 
     async def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        if os.getenv("ALLOW_UNSAFE_CODE_EXECUTION", "false").lower() != "true":
+            raise PermissionError(
+                "Code 节点默认禁用；生产环境请接入独立沙箱。仅本地可信代码可设置 "
+                "ALLOW_UNSAFE_CODE_EXECUTION=true"
+            )
         code = self.config.get("code", "")
         if not code:
             raise ValueError("请填写代码")
@@ -78,3 +84,6 @@ class CodeNode(Node):
             result["stdout"] = output
 
         return result
+
+    def validate_config(self) -> list[str]:
+        return [] if self.config.get("code") else ["code 不能为空"]

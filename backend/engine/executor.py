@@ -1,62 +1,47 @@
-"""执行器 — asyncio 并行执行工作流，SSE 流式输出。
-
-核心流程:
-  1. 请求输入创建 GraphRuntimeState
-  2. Graph.init + NodeFactory 将 JSON 构建为静态图
-  3. 节点执行时从运行态变量池解析输入
-  4. 逐层 asyncio.gather 并行执行并发送事件
-"""
+"""Ready-queue executor backed by a request-scoped GraphRuntimeState."""
 
 import asyncio
+import inspect
 import json
 import logging
+import time
+import uuid
 from typing import Any, AsyncGenerator, Callable
 
+from .execution_store import ExecutionStore
 from .graph import WorkflowGraph
 from .node_factory import NodeFactory
 from .runtime import GraphRuntimeState
 from .variable_pool import VariablePool
 
 logger = logging.getLogger(__name__)
+Callback = Callable[..., Any] | None
 
 
 class WorkflowExecutor:
-    """工作流执行器。只依赖 NodeRegistry，不依赖 FastAPI。"""
-
-    def __init__(self) -> None:
+    def __init__(self, store: ExecutionStore | None = None, max_concurrency: int = 10) -> None:
+        self.store = store or ExecutionStore()
+        self.max_concurrency = max(1, max_concurrency)
         self.pool = VariablePool()
         self.runtime_state: GraphRuntimeState | None = None
+        self.run_id: str | None = None
 
     async def run(
         self,
         graph_config: dict[str, Any],
         user_inputs: dict[str, Any],
         *,
-        on_node_start: Callable[[str, str], Any] | None = None,
-        on_node_finish: Callable[[str, dict[str, Any]], Any] | None = None,
-        on_workflow_finish: Callable[[dict[str, Any]], Any] | None = None,
-        on_error: Callable[[str], Any] | None = None,
+        on_node_start: Callback = None,
+        on_node_finish: Callback = None,
+        on_workflow_finish: Callback = None,
+        on_error: Callback = None,
+        on_event: Callback = None,
+        run_id: str | None = None,
         system_variables: dict[str, Any] | None = None,
         environment_variables: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """执行工作流，支持回调。
-
-        Args:
-            graph_config: {"nodes": [...], "edges": [...]}
-            user_inputs: 用户初始输入
-            on_node_start: 节点开始回调(node_id, node_type)
-            on_node_finish: 节点完成回调(node_id, outputs)
-            on_workflow_finish: 工作流完成回调(final_output)
-            on_error: 错误回调(error_message)
-            system_variables: 本次运行的系统变量，存入 sys 命名空间
-            environment_variables: 本次运行的环境变量，存入 env 命名空间
-
-        Returns:
-            最终输出 dict
-        """
-        # RuntimeState comes from this request, not from workflow JSON. Only the
-        # start node id is inspected before node construction so inputs can be
-        # placed in its variable namespace.
+        """Parse a graph and execute it with fresh state for this request."""
+        self.run_id = run_id or str(uuid.uuid4())
         root_node_id = self._find_root_node_id(graph_config)
         runtime_state = GraphRuntimeState.bootstrap(
             root_node_id,
@@ -67,84 +52,221 @@ class WorkflowExecutor:
         self.runtime_state = runtime_state
         self.pool = runtime_state.variable_pool
 
-        # Static Graph comes from JSON. Nodes receive a runtime reference, but
-        # user input is never copied into their config or constructor arguments.
+        # JSON creates the static node/edge objects. Request inputs stay in the
+        # runtime pool and are read only when each node is scheduled.
         graph = WorkflowGraph.init(graph_config, NodeFactory(runtime_state))
-        node_instances = graph.nodes
-        levels = graph.bfs_levels()
+        instances = graph.nodes
+        runtime_config = {
+            node_config["id"]: node_config.get("data") or {}
+            for node_config in graph_config.get("nodes", [])
+        }
 
-        logger.info("工作流开始，共 %d 层: %s", len(levels), [[n for n in lv] for lv in levels])
+        self.store.create_run(self.run_id, user_inputs, time.time())
+        await self._call(on_event, "workflow_start", {"run_id": self.run_id})
 
-        # 3. 分层执行
-        for level_idx, level in enumerate(levels):
-            logger.info("── 第 %d 层: %s ──", level_idx, level)
+        pending: dict[asyncio.Task[tuple[dict[str, Any], str | None, int, str]], str] = {}
+        queued: set[str] = set()
+        completed: set[str] = set()
+        skipped: set[str] = set()
+        ready: asyncio.Queue[str] = asyncio.Queue()
+        for node_id in graph.roots():
+            ready.put_nowait(node_id)
+            queued.add(node_id)
 
-            tasks = []
-            for nid in level:
-                node = node_instances[nid]
-                if on_node_start:
-                    await on_node_start(nid, node.node_type)
-                tasks.append(self._run_node(nid, node))
-
-            results = await asyncio.gather(*tasks)
-
-            for nid, outputs in results:
-                if on_node_finish:
-                    await on_node_finish(nid, outputs)
-
-            logger.info("── 第 %d 层完成 ──", level_idx)
-
-        # 4. 收集最终输出（最后一层的最后一个节点）
-        final_nid = levels[-1][-1]
-        final_output = runtime_state.outputs.get(final_nid, {})
-        if on_workflow_finish:
-            await on_workflow_finish(dict(final_output))
-
-        return dict(final_output)
-
-    async def run_sse(self, graph_config: dict[str, Any], user_inputs: dict[str, Any]) -> AsyncGenerator[str, None]:
-        """SSE 流式执行，yield SSE 格式的事件字符串。"""
-        events: list[str] = []
-
-        async def on_start(nid: str, ntype: str) -> None:
-            events.append(self._sse("node_start", {"node_id": nid, "node_type": ntype}))
-
-        async def on_finish(nid: str, outputs: dict[str, Any]) -> None:
-            events.append(self._sse("node_finish", {"node_id": nid, "outputs": outputs}))
-
-        async def on_wf_finish(output: dict[str, Any]) -> None:
-            events.append(self._sse("workflow_finish", {"result": output}))
-
-        async def on_err(msg: str) -> None:
-            events.append(self._sse("workflow_error", {"error": msg}))
+        async def propagate(targets: set[str]) -> None:
+            stack = list(targets)
+            while stack:
+                target = stack.pop()
+                if target in queued or target in completed or target in skipped:
+                    continue
+                state = graph.readiness(target)
+                if state == "ready":
+                    ready.put_nowait(target)
+                    queued.add(target)
+                elif state == "skip":
+                    skipped.add(target)
+                    self.store.update_node(self.run_id, target, "skipped", 0, time.time())
+                    await self._call(on_event, "node_skipped", {"node_id": target})
+                    stack.extend(graph.resolve_outgoing(target, "__never__"))
 
         try:
-            await self.run(
-                graph_config,
-                user_inputs,
-                on_node_start=on_start,
-                on_node_finish=on_finish,
-                on_workflow_finish=on_wf_finish,
-                on_error=on_err,
+            while not ready.empty() or pending:
+                while not ready.empty() and len(pending) < self.max_concurrency:
+                    node_id = ready.get_nowait()
+                    node = instances[node_id]
+                    node.execution_context = {
+                        "workflow_run_id": self.run_id,
+                        "node_id": node_id,
+                        "logical_execution_id": f"{self.run_id}:{node_id}",
+                    }
+                    inputs = node.resolve_inputs(skipped)
+                    await self._call(on_node_start, node_id, node.node_type)
+                    await self._call(on_event, "node_start", {"node_id": node_id, "node_type": node.node_type})
+                    task = asyncio.create_task(
+                        self._execute_node(node_id, node, inputs, runtime_config[node_id], on_event)
+                    )
+                    pending[task] = node_id
+
+                if not pending:
+                    break
+                done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    node_id = pending.pop(task)
+                    outputs, selected_handle, retry_count, status = task.result()
+                    runtime_state.record_output(node_id, outputs)
+                    completed.add(node_id)
+                    self.store.update_node(
+                        self.run_id,
+                        node_id,
+                        status,
+                        retry_count,
+                        time.time(),
+                        output=outputs,
+                    )
+                    await self._call(on_node_finish, node_id, outputs)
+                    await self._call(
+                        on_event,
+                        "node_finish",
+                        {
+                            "node_id": node_id,
+                            "outputs": outputs,
+                            "status": status,
+                            "retry_count": retry_count,
+                        },
+                    )
+                    await propagate(graph.resolve_outgoing(node_id, selected_handle))
+
+            unresolved = set(instances) - completed - skipped
+            if unresolved:
+                raise RuntimeError(f"工作流停止但仍有未决节点: {sorted(unresolved)}")
+            end_ids = [
+                node_id
+                for node_id, node in instances.items()
+                if node.node_type == "end" and node_id in completed
+            ]
+            result = {node_id: runtime_state.outputs[node_id] for node_id in end_ids}
+            final_output = next(iter(result.values())) if len(result) == 1 else result
+            self.store.update_run(self.run_id, "succeeded", time.time(), output=final_output)
+            await self._call(on_workflow_finish, final_output)
+            await self._call(
+                on_event,
+                "workflow_finish",
+                {"run_id": self.run_id, "result": final_output},
             )
-        except Exception as e:
-            logger.exception("工作流执行失败")
-            events.append(self._sse("workflow_error", {"error": str(e)}))
+            return final_output
+        except asyncio.CancelledError:
+            for task in pending:
+                task.cancel()
+            self.store.update_run(self.run_id, "cancelled", time.time(), error="client cancelled")
+            raise
+        except Exception as exc:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            self.store.update_run(self.run_id, "failed", time.time(), error=str(exc))
+            await self._call(on_error, str(exc))
+            await self._call(
+                on_event,
+                "workflow_error",
+                {"run_id": self.run_id, "error": str(exc)},
+            )
+            raise
 
-        for event in events:
-            yield event
+    async def _execute_node(
+        self,
+        node_id: str,
+        node: Any,
+        inputs: dict[str, Any],
+        data: dict[str, Any],
+        on_event: Callback,
+    ) -> tuple[dict[str, Any], str | None, int, str]:
+        retry = data.get("retry_config") or node.config.get("retry_config") or {}
+        enabled = bool(retry.get("retry_enabled", False))
+        max_retries = max(0, int(retry.get("max_retries", 0))) if enabled else 0
+        interval = max(0, int(retry.get("retry_interval", 0))) / 1000
+        timeout = data.get("timeout") or node.config.get("timeout")
+        strategy = data.get("error_strategy") or node.config.get("error_strategy")
+        retries = 0
+        while True:
+            self.store.update_node(self.run_id, node_id, "running", retries, time.time())
+            try:
+                call = node.run(inputs)
+                outputs = await asyncio.wait_for(call, float(timeout)) if timeout else await call
+                if not isinstance(outputs, dict):
+                    raise TypeError(f"节点 {node_id} 必须返回 dict")
+                selected = outputs.pop("_selected_handle", None)
+                return outputs, selected, retries, "succeeded"
+            except Exception as exc:
+                if retries < max_retries:
+                    retries += 1
+                    self.store.update_node(
+                        self.run_id,
+                        node_id,
+                        "retry",
+                        retries,
+                        time.time(),
+                        error=str(exc),
+                    )
+                    await self._call(
+                        on_event,
+                        "node_retry",
+                        {"node_id": node_id, "retry_count": retries, "error": str(exc)},
+                    )
+                    if interval:
+                        await asyncio.sleep(interval)
+                    continue
+                if strategy == "fail_branch":
+                    return {"error": str(exc)}, "fail-branch", retries, "exception"
+                if strategy == "default_value":
+                    default = data.get("default_value", node.config.get("default_value", {}))
+                    if not isinstance(default, dict):
+                        raise ValueError(f"节点 {node_id} 的 default_value 必须是对象") from exc
+                    return default, None, retries, "exception"
+                self.store.update_node(
+                    self.run_id,
+                    node_id,
+                    "failed",
+                    retries,
+                    time.time(),
+                    error=str(exc),
+                )
+                raise
 
-    async def _run_node(self, nid: str, node: Any) -> tuple[str, dict[str, Any]]:
-        """执行时从 RuntimeState 解析输入，再把输出写回同一运行态。"""
-        logger.debug("  执行 %s:%s", node.node_type, nid)
-        inputs = node.resolve_inputs()
-        outputs = await node.run(inputs)
-        if not isinstance(outputs, dict):
-            raise TypeError(f"节点 {nid} 必须返回 dict")
-        if self.runtime_state is None:
-            raise RuntimeError("工作流运行态未初始化")
-        self.runtime_state.record_output(nid, outputs)
-        return nid, outputs
+    async def run_sse(
+        self,
+        graph_config: dict[str, Any],
+        user_inputs: dict[str, Any],
+    ) -> AsyncGenerator[str, None]:
+        queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue()
+        error_emitted = False
+
+        async def emit(event: str, data: dict[str, Any]) -> None:
+            nonlocal error_emitted
+            if event == "workflow_error":
+                error_emitted = True
+            await queue.put((event, data))
+
+        async def execute() -> None:
+            try:
+                await self.run(graph_config, user_inputs, on_event=emit)
+            except Exception as exc:
+                logger.exception("工作流执行失败")
+                if not error_emitted:
+                    await queue.put(("workflow_error", {"run_id": self.run_id, "error": str(exc)}))
+            finally:
+                await queue.put(None)
+
+        task = asyncio.create_task(execute())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield self._sse(*item)
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     @staticmethod
     def _find_root_node_id(graph_config: dict[str, Any]) -> str:
@@ -165,6 +287,13 @@ class WorkflowExecutor:
         return starts[0]
 
     @staticmethod
+    async def _call(callback: Callback, *args: Any) -> None:
+        if callback is None:
+            return
+        result = callback(*args)
+        if inspect.isawaitable(result):
+            await result
+
+    @staticmethod
     def _sse(event: str, data: dict[str, Any]) -> str:
-        """生成 SSE 格式的事件"""
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"

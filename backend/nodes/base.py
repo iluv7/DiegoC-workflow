@@ -35,15 +35,16 @@ class Node(ABC):
         self.config = config
         self.input_mapping = input_mapping
         self.graph_runtime_state = graph_runtime_state
+        self.execution_context: dict[str, Any] = {}
 
-    def resolve_inputs(self) -> dict[str, Any]:
+    def resolve_inputs(self, missing_nodes: set[str] | None = None) -> dict[str, Any]:
         """Read this node's inputs from the per-run variable pool."""
         if self.graph_runtime_state is None:
             raise RuntimeError(f"节点 {self.node_id} 没有绑定运行态")
         pool = self.graph_runtime_state.variable_pool
         if self.node_type == "start":
             return pool.namespace(self.node_id)
-        return pool.resolve(self.input_mapping)
+        return pool.resolve(self.input_mapping, missing_nodes)
 
     @abstractmethod
     async def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
